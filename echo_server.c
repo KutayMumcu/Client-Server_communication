@@ -1,114 +1,151 @@
-/* ============================ */
-/*        echo_server.c        */
-/* ============================ */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <sys/time.h>
 
 #define PORT 8888
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 3
-#define SESSION_DURATION 30
 
-int client_count = 0;
-pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    int fd;         // socket fd
+    int slot;       // 0..MAX_CLIENTS-1
+    int user_id;    
+} client_t;
 
-int clients[MAX_CLIENTS];
-int client_ids[MAX_CLIENTS];
+client_t *clients[MAX_CLIENTS] = {0};
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+int next_user_id = 1;
+
+void broadcast_message(const char *msg, size_t len, client_t *exclude) {
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] && clients[i] != exclude) {
+            send(clients[i]->fd, msg, len, 0);
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+void remove_client(client_t *cli) {
+    pthread_mutex_lock(&clients_mutex);
+    clients[cli->slot] = NULL;
+    pthread_mutex_unlock(&clients_mutex);
+    close(cli->fd);
+    free(cli);
+}
 
 void *handle_client(void *arg) {
-    int client_fd = *((int *)arg);
+    client_t *cli = (client_t *)arg;
     char buffer[BUFFER_SIZE];
-    struct timeval start, current;
-    gettimeofday(&start, NULL);
+
+    char welcome[BUFFER_SIZE];
+    snprintf(welcome, sizeof(welcome),
+             "Welcome to the chat, User %d! Type 'exit' to leave.\n",
+             cli->user_id);
+    send(cli->fd, welcome, strlen(welcome), 0);
+
+    char join_msg[BUFFER_SIZE];
+    snprintf(join_msg, sizeof(join_msg),
+             "User %d has joined the chat.\n",
+             cli->user_id);
+    broadcast_message(join_msg, strlen(join_msg), cli);
 
     while (1) {
-        gettimeofday(&current, NULL);
-        int elapsed = current.tv_sec - start.tv_sec;
-        if (elapsed >= SESSION_DURATION) {
-            break;
-        }
-
         memset(buffer, 0, BUFFER_SIZE);
-        int read_size = recv(client_fd, buffer, BUFFER_SIZE, 0);
-        if (read_size <= 0) break;
+        int r = recv(cli->fd, buffer, BUFFER_SIZE - 1, 0);
+        if (r <= 0) break;
+        buffer[r] = '\0';
 
-        // Broadcast to other clients
-        pthread_mutex_lock(&client_mutex);
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i] != 0 && clients[i] != client_fd) {
-                char msg[BUFFER_SIZE + 10];
-                snprintf(msg, sizeof(msg), "#%d: %s", client_fd, buffer);
-                send(clients[i], msg, strlen(msg), 0);
-            }
-        }
-        pthread_mutex_unlock(&client_mutex);
-    }
-
-    close(client_fd);
-    pthread_mutex_lock(&client_mutex);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i] == client_fd) {
-            clients[i] = 0;
-            client_ids[i] = 0;
-            client_count--;
+        if (strncmp(buffer, "exit", 4) == 0 &&
+            (buffer[4] == '\n' || buffer[4] == '\0')) {
             break;
         }
+
+        char outbuf[BUFFER_SIZE + 32];
+        int n = snprintf(outbuf, sizeof(outbuf),
+                         "User %d: %s", cli->user_id, buffer);
+        broadcast_message(outbuf, n, cli);
     }
-    pthread_mutex_unlock(&client_mutex);
+
+    char leave_msg[BUFFER_SIZE];
+    snprintf(leave_msg, sizeof(leave_msg),
+             "User %d has left the chat.\n", cli->user_id);
+    broadcast_message(leave_msg, strlen(leave_msg), cli);
+
+    remove_client(cli);
+    pthread_exit(NULL);
     return NULL;
 }
 
 int main() {
-    int server_fd, client_fd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    int server_fd;
+    struct sockaddr_in addr;
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("Socket failed");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(PORT);
 
-    bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
-    listen(server_fd, MAX_CLIENTS);
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("Bind failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+    if (listen(server_fd, MAX_CLIENTS) < 0) {
+        perror("Listen failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
 
-    printf("Chat Server started on port %d\n", PORT);
+    printf("Chat server listening on port %d (max %d users)…\n", PORT, MAX_CLIENTS);
 
     while (1) {
-        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-
-        pthread_mutex_lock(&client_mutex);
-        if (client_count >= MAX_CLIENTS) {
-            printf("Rejected connection - max clients reached\n");
-            close(client_fd);
-            pthread_mutex_unlock(&client_mutex);
+        struct sockaddr_in client_addr;
+        socklen_t len = sizeof(client_addr);
+        int client_fd = accept(server_fd,
+                               (struct sockaddr*)&client_addr,
+                               &len);
+        if (client_fd < 0) {
+            perror("Accept failed");
             continue;
         }
 
-        int idx;
-        for (idx = 0; idx < MAX_CLIENTS; idx++) {
-            if (clients[idx] == 0) {
-                clients[idx] = client_fd;
-                client_ids[idx] = client_fd;
+        pthread_mutex_lock(&clients_mutex);
+        int slot = -1;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (!clients[i]) {
+                slot = i;
                 break;
             }
         }
+        pthread_mutex_unlock(&clients_mutex);
+
+        if (slot < 0) {
+            const char *full = "Server is full. Try again later.\n";
+            send(client_fd, full, strlen(full), 0);
+            close(client_fd);
+            continue;
+        }
+
+        client_t *cli = malloc(sizeof(client_t));
+        cli->fd      = client_fd;
+        cli->slot    = slot;
+        cli->user_id = next_user_id++;
+
+        pthread_mutex_lock(&clients_mutex);
+        clients[slot] = cli;
+        pthread_mutex_unlock(&clients_mutex);
 
         pthread_t tid;
-        pthread_create(&tid, NULL, handle_client, &clients[idx]);
+        pthread_create(&tid, NULL, handle_client, cli);
         pthread_detach(tid);
-        client_count++;
-        pthread_mutex_unlock(&client_mutex);
     }
 
     close(server_fd);
